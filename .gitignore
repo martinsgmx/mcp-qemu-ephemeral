@@ -1,0 +1,25 @@
+# Rust / Cargo build artifacts
+/target/
+*.rlib
+*.d
+
+# QEMU VM images and artifacts (large binaries — do not commit)
+/tmp/
+/images/
+*.iso
+*.qcow2
+*.img
+*.raw
+*.disk
+
+# Pi agent state (not part of the project)
+.pi/
+
+# Generated analysis cache (graphify)
+/graphify-out/
+
+# OS / editor artifacts
+.DS_Store
+*~
+*.swp
+*.swo

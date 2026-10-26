@@ -1,0 +1,13 @@
+[package]
+name = "mcp-qemu-recipe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "1"
+tokio = { workspace = true }
+mcp-qemu-core = { path = "../core" }

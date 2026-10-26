@@ -1,0 +1,17 @@
+[package]
+name = "mcp-qemu-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mcp-qemu-ephemeral"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+mcp-qemu-core = { path = "../core" }
+mcp-qemu-image-manager = { path = "../image-manager" }
+mcp-qemu-recipe = { path = "../recipe" }

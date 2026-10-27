@@ -1,0 +1,20 @@
+# Example recipe: run a script on an Alpine Linux live ISO (x86_64).
+#
+# This is the shape of the recipe the runner writes into every run
+# directory (`runs/<run_id>/recipe.yaml`), so an agent can always see
+# exactly how a VM was assembled. ISO-only recipes need no disk image:
+# the guest boots the live ISO and scripts run under busybox /bin/sh.
+#
+# Credentials: Alpine live ISOs log in as `root` with NO password
+# (empty string = press Enter at the password prompt).
+iso: images/isos/alpine-virt-3.22.7-x86_64.iso
+arch: x86_64
+memory_mib: 1024
+cpus: 2
+command: /bin/sh
+username: root
+password: ""
+boot_timeout_secs: 240
+qemu_args: []
+env: []
+args: []

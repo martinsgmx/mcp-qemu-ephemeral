@@ -12,22 +12,26 @@ use kuri_mcp_protocol::tool::{generate_tool_schema, ToolResult};
 use mcp_qemu_core::{QemuConfig, QemuHandle};
 use mcp_qemu_core::guest_agent::GuestAgent;
 use mcp_qemu_image_manager::ImageManager;
+use mcp_qemu_profiles::{self as profiles, Arch};
 use mcp_qemu_recipe::load_recipe;
+use mcp_qemu_runner::{self as runner, RunPaths, RunRequest};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
 /// Shared, mutable state injected into every tool handler.
-#[derive(Default)]
 pub struct ServerState {
     /// QEMU VMs indexed by PID.
     pub vms: HashMap<u32, QemuHandle>,
     /// Image manager.
     pub images: ImageManager,
+    /// Directory where run reports are written.
+    pub runs_dir: PathBuf,
 }
 
 impl ServerState {
@@ -35,7 +39,14 @@ impl ServerState {
         Self {
             vms: HashMap::new(),
             images: ImageManager::default(),
+            runs_dir: PathBuf::from("runs"),
         }
+    }
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -91,6 +102,47 @@ struct RecipeApplyParams {
 struct LogsFromAgentParams {
     pid: u32,
     logpath: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct IsoFetchParams {
+    /// Distro name from the registry (e.g. "alpine").
+    distro: String,
+    /// Optional ISO variant (e.g. "virt", "standard").
+    #[serde(default)]
+    variant: Option<String>,
+    /// Guest architecture ("x86_64" or "aarch64"). Default: x86_64.
+    #[serde(default)]
+    arch: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct VmTestScriptParams {
+    /// Distro name from the registry (e.g. "alpine").
+    distro: String,
+    /// The script (shell text) to run inside the VM.
+    script: String,
+    /// Optional ISO variant (e.g. "virt", "standard").
+    #[serde(default)]
+    variant: Option<String>,
+    /// Guest architecture ("x86_64" or "aarch64"). Default: x86_64.
+    #[serde(default)]
+    arch: Option<String>,
+    /// Guest memory in MiB. Default: 1024.
+    #[serde(default)]
+    memory_mib: Option<u64>,
+    /// Guest CPUs. Default: 2.
+    #[serde(default)]
+    cpus: Option<u64>,
+    /// Overall script timeout in seconds. Default: 300.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReportGetParams {
+    /// Run identifier as returned by vm_test_script / report_list.
+    run_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +569,264 @@ impl kuri::ToolHandler for LogsFromAgent {
 }
 
 // ---------------------------------------------------------------------------
+// High-level orchestration tools (profiles / runner)
+// ---------------------------------------------------------------------------
+
+/// Tool: list the distro profiles the server knows about.
+#[derive(Clone)]
+struct DistroList;
+
+#[async_trait(?Send)]
+impl kuri::ToolHandler for DistroList {
+    fn name(&self) -> &'static str {
+        "distro_list"
+    }
+    fn description(&self) -> &'static str {
+        "List every distro profile this server knows: variants, architectures, \
+ISO URLs, serial-console login credentials, guest shell, and usage notes. \
+Use this to decide how to boot a distro before running anything."
+    }
+    fn schema(&self) -> Value {
+        generate_tool_schema::<()>()
+            .expect("Failed to generate tool schema")
+    }
+    async fn call(
+        &self,
+        _context: &kuri::context::Context,
+        _params: Value,
+    ) -> ToolResult<Value> {
+        Ok(serde_json::Value::Array(
+            profiles::all()
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "distro": p.distro,
+                        "variant": p.variant,
+                        "version": p.version,
+                        "arch": p.arch.as_str(),
+                        "iso_url": p.iso_url,
+                        "login_username": p.login.username,
+                        "login_password_empty": p.login.password.is_empty(),
+                        "shell": p.shell,
+                        "package_manager": p.package_manager,
+                        "notes": p.notes,
+                    })
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// Tool: fetch (and sha256-verify) a distro's ISO without starting a VM.
+#[derive(Clone)]
+struct IsoFetch;
+
+#[async_trait(?Send)]
+impl kuri::ToolHandler for IsoFetch {
+    fn name(&self) -> &'static str {
+        "iso_fetch"
+    }
+    fn description(&self) -> &'static str {
+        "Download a distro ISO into the image cache if not already present \
+(sha256-verified against the mirror). Returns the local ISO path."
+    }
+    fn schema(&self) -> Value {
+        generate_tool_schema::<IsoFetchParams>()
+            .expect("Failed to generate tool schema")
+    }
+    async fn call(
+        &self,
+        context: &kuri::context::Context,
+        params: Value,
+    ) -> ToolResult<Value> {
+        let params: IsoFetchParams = serde_json::from_value(params)
+            .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+        let state: Inject<Arc<Mutex<ServerState>>> =
+            kuri::context::FromContext::from_context(context);
+        let images_dir = {
+            let state = state.lock().unwrap();
+            state.images.images_dir().to_path_buf()
+        };
+
+        let arch = params
+            .arch
+            .map(|a| Arch::from_str(&a))
+            .transpose()
+            .map_err(|e| ToolError::InvalidParameters(e))?;
+        let arch = arch.unwrap_or(Arch::X86_64);
+        let profile = profiles::lookup(&params.distro, params.variant.as_deref(), arch)
+            .ok_or_else(|| {
+                ToolError::InvalidParameters(format!(
+                    "no profile for distro \"{}\" (see distro_list)",
+                    params.distro
+                ))
+            })?;
+
+        let images = ImageManager::new(images_dir);
+        let path = images
+            .ensure_iso(profile.iso_url)
+            .await
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        Ok(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "distro": profile.distro,
+            "variant": profile.variant,
+            "version": profile.version,
+            "arch": profile.arch.as_str(),
+        }))
+    }
+}
+
+/// Tool: one-shot "test my script in distro X".
+#[derive(Clone)]
+struct VmTestScript;
+
+#[async_trait(?Send)]
+impl kuri::ToolHandler for VmTestScript {
+    fn name(&self) -> &'static str {
+        "vm_test_script"
+    }
+    fn description(&self) -> &'static str {
+        "Run a script inside an ephemeral QEMU VM for the given distro and \
+return a structured report (status, exit code, detected failures, console \
+tail) plus a run_id for report_get. The VM boots the distro's live ISO, \
+logs in automatically on the serial console, runs the script under the \
+distro's shell, and is torn down afterwards. This is the one-call path for \
+requests like \"test my bash script in Linux Alpine\"."
+    }
+    fn schema(&self) -> Value {
+        generate_tool_schema::<VmTestScriptParams>()
+            .expect("Failed to generate tool schema")
+    }
+    async fn call(
+        &self,
+        context: &kuri::context::Context,
+        params: Value,
+    ) -> ToolResult<Value> {
+        let params: VmTestScriptParams = serde_json::from_value(params)
+            .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+        let state: Inject<Arc<Mutex<ServerState>>> =
+            kuri::context::FromContext::from_context(context);
+        let (images_dir, runs_dir) = {
+            let state = state.lock().unwrap();
+            (
+                state.images.images_dir().to_path_buf(),
+                state.runs_dir.clone(),
+            )
+        };
+
+        let arch = params
+            .arch
+            .map(|a| Arch::from_str(&a))
+            .transpose()
+            .map_err(|e| ToolError::InvalidParameters(e))?;
+        let request = RunRequest {
+            distro: params.distro,
+            variant: params.variant,
+            arch,
+            script: params.script,
+            memory_mib: params.memory_mib,
+            cpus: params.cpus,
+            timeout_secs: params.timeout_secs,
+            boot_timeout_secs: None,
+        };
+
+        let report = runner::run(request, RunPaths { images_dir, runs_dir })
+            .await
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        serde_json::to_value(&report)
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))
+    }
+}
+
+/// Tool: list all finished runs.
+#[derive(Clone)]
+struct ReportList;
+
+#[async_trait(?Send)]
+impl kuri::ToolHandler for ReportList {
+    fn name(&self) -> &'static str {
+        "report_list"
+    }
+    fn description(&self) -> &'static str {
+        "List all recorded VM runs (newest first) with their statuses and \
+exit codes."
+    }
+    fn schema(&self) -> Value {
+        generate_tool_schema::<()>()
+            .expect("Failed to generate tool schema")
+    }
+    async fn call(
+        &self,
+        context: &kuri::context::Context,
+        _params: Value,
+    ) -> ToolResult<Value> {
+        let state: Inject<Arc<Mutex<ServerState>>> =
+            kuri::context::FromContext::from_context(context);
+        let runs_dir = {
+            let state = state.lock().unwrap();
+            state.runs_dir.clone()
+        };
+        let reports = runner::report_list(&runs_dir)
+            .await
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        Ok(serde_json::Value::Array(
+            reports
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "run_id": r.run_id,
+                        "distro": r.distro,
+                        "variant": r.variant,
+                        "arch": r.arch,
+                        "status": r.status,
+                        "exit_code": r.exit_code,
+                        "duration_secs": r.duration_secs,
+                    })
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// Tool: read one run's report (markdown).
+#[derive(Clone)]
+struct ReportGet;
+
+#[async_trait(?Send)]
+impl kuri::ToolHandler for ReportGet {
+    fn name(&self) -> &'static str {
+        "report_get"
+    }
+    fn description(&self) -> &'static str {
+        "Retrieve the full markdown report of a previous VM run (status, \
+failures, console output, artifacts). Use report_list to find run_ids."
+    }
+    fn schema(&self) -> Value {
+        generate_tool_schema::<ReportGetParams>()
+            .expect("Failed to generate tool schema")
+    }
+    async fn call(
+        &self,
+        context: &kuri::context::Context,
+        params: Value,
+    ) -> ToolResult<Value> {
+        let params: ReportGetParams = serde_json::from_value(params)
+            .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+        let state: Inject<Arc<Mutex<ServerState>>> =
+            kuri::context::FromContext::from_context(context);
+        let runs_dir = {
+            let state = state.lock().unwrap();
+            state.runs_dir.clone()
+        };
+        let text = runner::report_get(&runs_dir, &params.run_id)
+            .await
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+        Ok(serde_json::Value::String(text))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Service builder
 // ---------------------------------------------------------------------------
 
@@ -538,6 +848,11 @@ pub fn build_mcp_service() -> MCPService {
     .with_tool(ImageList)
     .with_tool(RecipeApply)
     .with_tool(LogsFromAgent)
+    .with_tool(DistroList)
+    .with_tool(IsoFetch)
+    .with_tool(VmTestScript)
+    .with_tool(ReportList)
+    .with_tool(ReportGet)
     .with_state(Inject::new(state))
     .build()
 }

@@ -11,3 +11,4 @@ anyhow = { workspace = true }
 thiserror = "1"
 tokio = { workspace = true }
 mcp-qemu-core = { path = "../core" }
+mcp-qemu-profiles = { path = "../profiles" }

@@ -23,6 +23,28 @@ enum Cli {
         /// Path to the script to execute inside the VM.
         script: String,
     },
+    /// Test a script inside an ephemeral VM for a known distro.
+    ///
+    /// The high-level flow: fetch the distro ISO if needed, boot it as a
+    /// live ISO with automatic serial-console login, run the script under
+    /// the distro's shell, capture output/failures, tear down, and write a
+    /// report into `runs/<run_id>/`. Prints the report to stdout.
+    Test {
+        /// Distro name from the profile registry (e.g. "alpine").
+        #[arg(long, default_value = "alpine")]
+        distro: String,
+        /// ISO variant (e.g. "virt", "standard").
+        #[arg(long)]
+        variant: Option<String>,
+        /// Guest architecture ("x86_64" or "aarch64").
+        #[arg(long)]
+        arch: Option<String>,
+        /// Overall script timeout in seconds.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Path to the script to run inside the VM.
+        script: String,
+    },
     /// Image management subcommands (stub).
     Image,
     /// Recipe management subcommands (stub).
@@ -89,6 +111,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exit(code);
             }
             Ok(())
+        }
+        Cli::Test {
+            distro,
+            variant,
+            arch,
+            timeout_secs,
+            script,
+        } => {
+            let script_text =
+                std::fs::read_to_string(&script).unwrap_or_else(|e| {
+                    eprintln!("error: cannot read script {script}: {e}");
+                    exit(1);
+                });
+            let arch = match arch.as_deref() {
+                Some(a) => match a.parse() {
+                    Ok(arch) => Some(arch),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        exit(1);
+                    }
+                },
+                None => None,
+            };
+            let request = mcp_qemu_runner::RunRequest {
+                distro,
+                variant,
+                arch,
+                script: script_text,
+                memory_mib: None,
+                cpus: None,
+                timeout_secs,
+                boot_timeout_secs: None,
+            };
+            let report = mcp_qemu_runner::run(
+                request,
+                mcp_qemu_runner::RunPaths {
+                    images_dir: mcp_qemu_image_manager::DEFAULT_IMAGES_DIR.into(),
+                    runs_dir: "runs".into(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                exit(1);
+            });
+
+            // Print the report and mirror the script's outcome.
+            let md = std::fs::read_to_string(&report.report_path).unwrap_or_default();
+            print!("{md}");
+            if report.status.is_success() {
+                println!("run_id: {}", report.run_id);
+                Ok(())
+            } else {
+                println!("run_id: {} (status: {})", report.run_id, report.status);
+                exit(1)
+            }
         }
         Cli::Image => {
             println!("image subcommand not yet implemented");

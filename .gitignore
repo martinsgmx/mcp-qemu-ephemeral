@@ -12,6 +12,9 @@
 *.raw
 *.disk
 
+# Runtime run artifacts (generated reports / serial logs — do not commit)
+/runs/
+
 # Pi agent state (not part of the project)
 .pi/
 

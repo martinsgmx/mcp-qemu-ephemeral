@@ -4,6 +4,8 @@ members = [
     "core",
     "image-manager",
     "recipe",
+    "profiles",
+    "runner",
     "mcp-server",
     "cli",
 ]

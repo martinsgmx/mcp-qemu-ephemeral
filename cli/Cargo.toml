@@ -15,3 +15,5 @@ clap = { version = "4", features = ["derive"] }
 mcp-qemu-core = { path = "../core" }
 mcp-qemu-image-manager = { path = "../image-manager" }
 mcp-qemu-recipe = { path = "../recipe" }
+mcp-qemu-profiles = { path = "../profiles" }
+mcp-qemu-runner = { path = "../runner" }

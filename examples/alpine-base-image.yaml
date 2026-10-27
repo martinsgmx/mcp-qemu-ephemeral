@@ -1,0 +1,18 @@
+# Example recipe: boot a pre-installed base image (qcow2) instead of a
+# live ISO. Use this shape when the VM has a real OS installed on disk.
+#
+# Note: for a *live ISO* run (the common "test my script" path), see
+# alpine-live-iso.yaml in this directory instead — it uses `iso:` only.
+image: images/base/alpine-base.qcow2
+arch: x86_64
+memory_mib: 2048
+cpus: 2
+command: /bin/sh
+args:
+  - "-c"
+  - "echo hello from the installed system"
+username: root
+password: ""
+boot_timeout_secs: 240
+qemu_args: []
+env: []

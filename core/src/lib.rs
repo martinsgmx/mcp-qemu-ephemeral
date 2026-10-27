@@ -28,12 +28,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 
 /// Error type for all QEMU lifecycle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum QemuError {
     /// The QEMU binary was not found on PATH.
-    #[error("qemu-system-x86_64 not found on PATH")]
+    #[error("QEMU binary not found on PATH")]
     QemuNotFound,
     /// Failed to spawn the QEMU process.
     #[error("failed to spawn qemu: {0}")]
@@ -94,6 +95,13 @@ pub struct QemuConfig {
     /// Empty string means the guest accepts an empty password (enter-key
     /// login, e.g. Arch/Alpine root live images).
     pub password: Option<String>,
+    /// Boot-loader prompt marker to watch for on the serial console
+    /// (e.g. ISOLINUX `boot:`). When seen (and not yet answered),
+    /// `boot_response` is sent as one line.
+    pub boot_prompt: Option<String>,
+    /// Line to send at the boot-loader prompt (kernel + initrd + serial
+    /// console kernel argument).
+    pub boot_response: Option<String>,
     /// Shell timeout in seconds while waiting for the boot sequence to reach a
     /// shell prompt (default: 120).
     pub boot_timeout_secs: u64,
@@ -126,6 +134,8 @@ impl Default for QemuConfig {
             guest_args: None,
             username: None,
             password: None,
+            boot_prompt: None,
+            boot_response: None,
             boot_timeout_secs: 120,
             auto_boot_interact: true,
         }
@@ -149,6 +159,17 @@ pub struct QemuHandle {
     username: Option<String>,
     /// Password for the serial-console boot interaction.
     password: Option<String>,
+    /// Boot-loader prompt marker to answer (see [`QemuConfig::boot_prompt`]).
+    boot_prompt: Option<String>,
+    /// Line to send when the boot-loader prompt appears.
+    boot_response: Option<String>,
+    /// Serial console (child stdout) reader channel. The bytes are pumped
+    /// here by a dedicated task so that timed-out reads (boot interaction,
+    /// script deadlines) never lose data: a cancelled `recv` leaves the
+    /// bytes buffered in the channel.
+    stdout_rx: Option<mpsc::Receiver<std::io::Result<u8>>>,
+    /// Child stderr reader channel (QEMU diagnostics).
+    stderr_rx: Option<mpsc::Receiver<std::io::Result<u8>>>,
 }
 
 impl QemuHandle {
@@ -186,7 +207,7 @@ impl QemuHandle {
             .arg("-serial")
             .arg("stdio")
             .arg("-monitor")
-            .arg("devnull");
+            .arg("none");
 
         // Drive image.
         if let Some(img) = &config.drive_image {
@@ -194,10 +215,24 @@ impl QemuHandle {
                 .arg(format!("file={},format=qcow2", img));
         }
 
-        // ISO attachment.
+        // ISO attachment. On x86 the classic `-cdrom` shorthand works; on
+        // aarch64 `-M virt` has no IDE controller, so the CD-ROM is hung
+        // off a virtio-scsi device instead.
         if let Some(iso) = &config.iso {
-            cmd.arg("-cdrom")
-                .arg(format!("file={}", iso));
+            if config.binary.contains("aarch64") {
+                cmd.arg("-device").arg("virtio-scsi-pci,id=mcpq-scsi")
+                    .arg("-drive")
+                    .arg(format!("if=none,id=mcpq-cd,file={},media=cdrom,format=raw", iso))
+                    .arg("-device").arg("scsi-cd,drive=mcpq-cd");
+            } else {
+                cmd.arg("-cdrom").arg(iso);
+            }
+        }
+
+        // Boot order: when an ISO is the boot medium, boot from it first —
+        // otherwise SeaBIOS stalls on "Booting from Hard Disk..." forever.
+        if config.iso.is_some() {
+            cmd.arg("-boot").arg("d");
         }
 
         // Memory and CPUs.
@@ -226,7 +261,7 @@ impl QemuHandle {
             cmd.env(k, v);
         }
 
-        let child = cmd
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::piped())
@@ -237,6 +272,14 @@ impl QemuHandle {
 
         let agent_socket = config.agent_socket;
 
+        // Pump child stdout/stderr into buffered channels via dedicated
+        // reader tasks. Tokio's child stdio reads are NOT cancellation-safe
+        // (they run through a blocking thread), so any `timeout(read)`
+        // cancellation would silently swallow bytes. With the pump, a
+        // cancelled `recv()` simply leaves bytes buffered in the channel.
+        let stdout_rx = pump_stream(child.stdout.take());
+        let stderr_rx = pump_stream(child.stderr.take());
+
         // Run the automatic serial-console boot interaction when configured.
         let mut handle = Self {
             child,
@@ -245,6 +288,10 @@ impl QemuHandle {
             agent_socket,
             username: config.username,
             password: config.password,
+            boot_prompt: config.boot_prompt,
+            boot_response: config.boot_response,
+            stdout_rx,
+            stderr_rx,
         };
         if config.auto_boot_interact {
             match handle.interact_boot(config.boot_timeout_secs).await {
@@ -327,25 +374,49 @@ impl QemuHandle {
     ///
     /// Returns `None` when the stream is closed and no data was buffered.
     pub async fn read_line(&mut self) -> Result<Option<String>, QemuError> {
-        let stdout = self.child.stdout.as_mut().unwrap();
         let mut line = Vec::new();
+        let rx = match self.stdout_rx.as_mut() {
+            Some(rx) => rx,
+            None => return Ok(None),
+        };
         loop {
-            let mut byte = [0u8; 1];
-            let n = stdout.read(&mut byte).await?;
-            if n == 0 {
-                // Stream closed; return any buffered line.
-                if line.is_empty() {
-                    return Ok(None);
+            match rx.recv().await {
+                None => {
+                    // Stream closed; return any buffered line.
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(String::from_utf8_lossy(&line).to_string()));
                 }
-                return Ok(Some(String::from_utf8_lossy(&line).to_string()));
-            }
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                // Strip trailing newline.
-                line.pop();
-                return Ok(Some(String::from_utf8_lossy(&line).to_string()));
+                Some(Err(e)) => return Err(QemuError::Io(e)),
+                Some(Ok(b)) => {
+                    line.push(b);
+                    if b == b'\n' {
+                        // Strip trailing newline (and CR).
+                        line.pop();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        return Ok(Some(String::from_utf8_lossy(&line).to_string()));
+                    }
+                }
             }
         }
+    }
+
+    /// Write raw text to the guest's serial console (its terminal stdin),
+    /// with no trailing newline. Use [`QemuHandle::send_line`] for single
+    /// lines.
+    pub async fn send_text(&mut self, text: &str) -> Result<(), QemuError> {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        write_serial_line(stdin, text).await
+    }
+
+    /// Write one line (text + `\n`) to the guest's serial console, as if the
+    /// user had typed it and pressed Enter.
+    pub async fn send_line(&mut self, text: &str) -> Result<(), QemuError> {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        write_serial_line(stdin, &format!("{text}\n")).await
     }
 
     /// Stream all output from stdout and stderr to a writer.
@@ -358,12 +429,9 @@ impl QemuHandle {
         &mut self,
         mut writer: W,
     ) -> Result<(), QemuError> {
-        let stdout = self.child.stdout.as_mut().unwrap();
-        let stderr = self.child.stderr.as_mut().unwrap();
-
-        // Drain each stream into a Vec until EOF, then forward to the writer.
-        let stdout_data = drain_stream(stdout).await;
-        let stderr_data = drain_stream(stderr).await;
+        // Drain each channel into a Vec until EOF, then forward to the writer.
+        let stdout_data = drain_channel(&mut self.stdout_rx).await;
+        let stderr_data = drain_channel(&mut self.stderr_rx).await;
 
         let _ = writer.write(&stdout_data).await;
         let _ = writer.write(&stderr_data).await;
@@ -372,19 +440,48 @@ impl QemuHandle {
     }
 }
 
-/// Drain one async read stream into a Vec until EOF.
-async fn drain_stream<S: tokio::io::AsyncRead + Unpin>(
-    mut stream: S,
-) -> Vec<u8> {
+/// Drain one reader channel into a Vec until EOF.
+async fn drain_channel(rx: &mut Option<mpsc::Receiver<std::io::Result<u8>>>) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    while let Ok(n) = stream.read(&mut buf).await {
-        if n == 0 {
-            break;
+    let Some(rx) = rx else { return out };
+    while let Some(item) = rx.recv().await {
+        match item {
+            Ok(b) => out.push(b),
+            Err(_) => break,
         }
-        out.extend_from_slice(&buf[..n]);
     }
     out
+}
+
+/// Spawn a task that pumps `stream` bytes into a buffered channel, so
+/// timed-out/cancelled reads never lose data (tokio child stdio reads are
+/// not cancellation-safe).
+fn pump_stream(
+    stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+) -> Option<mpsc::Receiver<std::io::Result<u8>>> {
+    let stream = stream?;
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut buf = [0u8; 512];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    for b in &buf[..n] {
+                        if tx.send(Ok(*b)).await.is_err() {
+                            return; // receiver dropped
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+    });
+    Some(rx)
 }
 
 impl QemuHandle {
@@ -394,7 +491,6 @@ impl QemuHandle {
         Ok(code)
     }
 }
-
 impl Drop for QemuHandle {
     fn drop(&mut self) {
         // Best-effort kill on drop to avoid leaking processes.
@@ -455,7 +551,7 @@ pub enum BootInteractError {
     #[error("{0} (last 500 serial bytes: {1:?})")]
     Io(#[source] std::io::Error, Vec<u8>),
     /// The boot interaction aborted before reaching a shell prompt.
-    #[error("automatic boot interaction aborted: {reason} (last 500 serial bytes: {tail:?})")]
+    #[error("automatic boot interaction aborted: {reason} (last 500 serial bytes: {tail_text})", tail_text = String::from_utf8_lossy(&tail))]
     Aborted {
         reason: BootAbortReason,
         tail: Vec<u8>,
@@ -481,11 +577,29 @@ impl From<QemuError> for BootInteractError {
 /// sequence ABORTs and returns the last 500 bytes of serial output inside
 /// [`BootInteractResult::Aborted`], never retrying a failed login.
 impl QemuHandle {
+    /// Drive the serial console through the boot sequence until a shell
+    /// prompt is reached.
+    ///
+    /// Reads the console **byte by byte** (with a 50 ms idle tick) so that
+    /// prompt lines that never end with a newline (e.g. `localhost:~# `)
+    /// are still detected. On each `login:` prompt the configured
+    /// credentials are sent (empty password = enter-key login). On
+    /// "login incorrect" or the boot timeout the sequence ABORTs with the
+    /// last 500 bytes of serial output, never retrying a failed login.
     pub async fn interact_boot(&mut self, timeout_secs: u64) -> Result<BootInteractResult, QemuError> {
         let timeout_secs = timeout_secs.max(1);
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let tick = Duration::from_millis(50);
 
         let mut tail = Vec::new();
+        let mut line = Vec::new();
+        // Login stage machine: 0 = awaiting `login:`, 1 = awaiting
+        // `Password:` (or directly the shell for enter-key logins), 2 =
+        // credentials fully sent.
+        let mut login_stage = 0u8;
+        // Answer the boot-loader prompt at most once.
+        let mut boot_answered = false;
+
         loop {
             // ABORT on timeout: no shell prompt within the boot timeout.
             if Instant::now() >= deadline {
@@ -495,61 +609,190 @@ impl QemuHandle {
                 });
             }
 
-            match self.read_line().await {
-                Ok(Some(line)) => {
-                    let lower = line.to_lowercase();
-
-                    // GitHub-style login: send the configured user and password
-                    // (an empty password value = enter-key login, e.g. Arch root).
-                    if lower.contains("login:") {
-                        let stdin = self.child.stdin.as_mut().unwrap();
-                        let credentials =
-                            format!(
-                                "{} {}",
-                                username_line(self.username.as_deref()),
-                                password_line(self.password.as_deref()),
-                            );
-                        if let Err(e) = write_serial_line(stdin, &credentials).await {
-                            return Err(e);
-                        }
-                        continue;
-                    }
-
-                    // Authentication failed: dump the tail and abort, no retry.
-                    if lower.contains("login incorrect") {
+            let read_result = {
+                let rx = match self.stdout_rx.as_mut() {
+                    Some(rx) => rx,
+                    None => {
                         return Ok(BootInteractResult::Aborted {
-                            reason: BootAbortReason::LoginIncorrect,
+                            reason: BootAbortReason::Timeout,
                             tail,
-                        });
+                        })
                     }
-
-                    // Shell prompt reached: the VM is READY and can run commands.
-                    if looks_like_shell_prompt(&line) {
+                };
+                tokio::time::timeout(tick, rx.recv()).await
+            };
+            let b: u8 = match read_result {
+                Err(_elapsed) => {
+                    // Console idle. A newline-less prompt may be sitting in
+                    // `line`: either a shell prompt (READY), a login prompt,
+                    // or a boot-loader prompt that must be answered.
+                    if is_partial_shell_prompt(&line) {
                         return Ok(BootInteractResult::Ready);
                     }
-
-                    // Keep only the last 500 bytes for diagnostics.
-                    keep_last_500(&mut tail, line.as_bytes());
+                    if !boot_answered {
+                        if let (Some(marker), Some(response)) =
+                            (self.boot_prompt.as_deref(), self.boot_response.as_deref())
+                        {
+                            if contains_substring(&line, marker.as_bytes()) {
+                                let stdin = self.child.stdin.as_mut().unwrap();
+                                write_serial_line(stdin, &format!("{response}\n")).await?;
+                                boot_answered = true;
+                                line.clear();
+                                keep_last_500(&mut tail, marker.as_bytes());
+                            }
+                        }
+                    }
+                    // Getty prints `… login: ` WITHOUT a trailing newline,
+                    // so this is usually caught here (idle), not in the
+                    // complete-line path below.
+                    if login_stage == 0 && contains_substring(&line, b"login:") {
+                        let stdin = self.child.stdin.as_mut().unwrap();
+                        let credentials = username_line(self.username.as_deref());
+                        write_serial_line(stdin, &credentials).await?;
+                        login_stage = 1;
+                        line.clear();
+                        keep_last_500(&mut tail, b"login:");
+                        continue;
+                    }
+                    if login_stage == 1 && contains_substring(&line, b"Password:") {
+                        let stdin = self.child.stdin.as_mut().unwrap();
+                        let credentials = password_line(self.password.as_deref());
+                        write_serial_line(stdin, &credentials).await?;
+                        login_stage = 2;
+                        line.clear();
+                        keep_last_500(&mut tail, b"Password:");
+                        continue;
+                    }
+                    continue;
                 }
                 Ok(None) => {
-                    // No more serial output before a prompt (VM ended, etc.).
+                    // EOF: QEMU closed stdout (it probably died). Drain its
+                    // stderr so the failure carries an actual diagnostic.
+                    if let Some(stderr_rx) = self.stderr_rx.as_mut() {
+                        let mut errbuf = Vec::new();
+                        loop {
+                            match tokio::time::timeout(
+                                Duration::from_millis(200),
+                                stderr_rx.recv(),
+                            )
+                            .await
+                            {
+                                Err(_) | Ok(None) | Ok(Some(Err(_))) => break,
+                                Ok(Some(Ok(b))) => errbuf.push(b),
+                            }
+                            if errbuf.len() > 4096 {
+                                break;
+                            }
+                        }
+                        if !errbuf.is_empty() {
+                            keep_last_500(&mut tail, &errbuf);
+                        }
+                    }
                     return Ok(BootInteractResult::Aborted {
                         reason: BootAbortReason::Timeout,
                         tail,
                     });
                 }
-                Err(e) => match e {
-                    QemuError::Io(io) => return Err(QemuError::Io(io)),
-                    _ => {
-                        return Err(QemuError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("qemu: {e}"),
-                        )))
-                    }
-                },
+                Ok(Some(Ok(b))) => b,
+                Ok(Some(Err(e))) => return Err(QemuError::Io(e)),
+            };
+
+            line.push(b);
+
+            if b != b'\n' {
+                // Partial line: prompts do not end with a newline, so check
+                // whether one has already appeared.
+                if is_partial_shell_prompt(&line) {
+                    return Ok(BootInteractResult::Ready);
+                }
+                continue;
             }
+
+            // Complete line: strip the trailing newline (and CR).
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let text = String::from_utf8_lossy(&line).to_string();
+            line.clear();
+
+            let lower = text.to_lowercase();
+
+            // Boot-loader prompt (e.g. ISOLINUX `boot:`): send the profile's
+            // boot line so the kernel console goes to the serial port.
+            if !boot_answered {
+                if let (Some(marker), Some(response)) =
+                    (self.boot_prompt.as_deref(), self.boot_response.as_deref())
+                {
+                    if lower.contains(marker) {
+                        let stdin = self.child.stdin.as_mut().unwrap();
+                        write_serial_line(stdin, &format!("{response}\n")).await?;
+                        boot_answered = true;
+                        keep_last_500(&mut tail, text.as_bytes());
+                        continue;
+                    }
+                }
+            }
+
+            // Login prompt (complete-line variant, for gettys that do end
+            // the prompt with a newline): send username, then wait for
+            // `Password:` — or, for enter-key logins, straight for the
+            // shell.
+            if login_stage == 0 && lower.contains("login:") {
+                let stdin = self.child.stdin.as_mut().unwrap();
+                let credentials = username_line(self.username.as_deref());
+                write_serial_line(stdin, &credentials).await?;
+                login_stage = 1;
+                keep_last_500(&mut tail, text.as_bytes());
+                continue;
+            }
+
+            // Password prompt (complete-line variant).
+            if login_stage == 1 && lower.contains("password:") {
+                let stdin = self.child.stdin.as_mut().unwrap();
+                let credentials = password_line(self.password.as_deref());
+                write_serial_line(stdin, &credentials).await?;
+                login_stage = 2;
+                keep_last_500(&mut tail, text.as_bytes());
+                continue;
+            }
+
+            // Authentication failed: dump the tail and abort, no retry.
+            if login_stage >= 1 && lower.contains("login incorrect") {
+                return Ok(BootInteractResult::Aborted {
+                    reason: BootAbortReason::LoginIncorrect,
+                    tail,
+                });
+            }
+
+            // Shell prompt reached: the VM is READY and can run commands.
+            if looks_like_shell_prompt(&text) {
+                return Ok(BootInteractResult::Ready);
+            }
+
+            // Keep only the last 500 bytes for diagnostics.
+            keep_last_500(&mut tail, text.as_bytes());
         }
     }
+}
+
+/// True when the console is idle and the partial (newline-less) line ends
+/// in a shell-prompt shape (`…# ` / `…$ `).
+///
+/// Requiring the trailing space avoids false positives on banner lines
+/// like `### Welcome to Alpine Linux ###` (which end in `#`, not `# `).
+fn is_partial_shell_prompt(line: &[u8]) -> bool {
+    line.ends_with(b"# ") || line.ends_with(b"$ ")
+}
+
+/// True when `haystack` contains `needle` (byte-level substring).
+fn contains_substring(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle)
 }
 
 /// Write a line to the serial console, which is the guest's terminal.
@@ -566,11 +809,16 @@ where
         .map_err(QemuError::Io)
 }
 
-/// Keep only the last 500 bytes of `tail`.
+/// Append `bytes` to the diagnostic tail, keeping only the last 500 bytes.
+///
+/// Appending (then truncating) — rather than replacing — is essential:
+/// empty/blank lines must not wipe out the useful history before them.
 fn keep_last_500(tail: &mut Vec<u8>, bytes: &[u8]) {
-    tail.clear();
-    let upto = bytes.get(..bytes.len().min(500)).unwrap_or(bytes);
-    tail.extend_from_slice(upto);
+    tail.extend_from_slice(bytes);
+    if tail.len() > 500 {
+        let drop = tail.len() - 500;
+        tail.drain(..drop);
+    }
 }
 
 /// Build the user-name line for a login prompt. Defaults to `root`.
@@ -587,19 +835,28 @@ fn password_line(password: Option<&str>) -> String {
     }
 }
 
-/// Heuristic: does the line look like a shell prompt (`# …` or `$ …`)?
+/// Heuristic: does the line look like a shell prompt?
+///
+/// Matches two families of prompt lines:
+/// - a *leading* prompt character: `#` or `$` alone or followed by
+///   whitespace/text (e.g. `# arch`, `$ root@arch:`), but not a shebang
+///   (`#!/bin/sh`, where `!` follows the `#`);
+/// - a *trailing* prompt character, which is how most real guests print
+///   prompts (e.g. `localhost:~#`, `[root@archiso ~]#`, `sh-5.1$`).
 fn looks_like_shell_prompt(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return false;
     }
-    let first = trimmed.chars().next().unwrap();
-    let is_alpha = trimmed
-        .chars()
-        .next()
-        .map(|c| c.is_alphabetic())
-        .unwrap_or(false);
-    (first == '#' && is_alpha) || (first == '$' && is_alpha)
+    let mut chars = trimmed.chars();
+    let first = chars.next().unwrap();
+    match first {
+        '#' | '$' => match chars.next() {
+            None => true,
+            Some(c) => c.is_whitespace() || c.is_alphanumeric(),
+        },
+        _ => trimmed.ends_with('#') || trimmed.ends_with('$'),
+    }
 }
 
 /// Run the automatic boot-interaction sequence when the config enables it.
@@ -644,6 +901,10 @@ mod tests {
             agent_socket: None,
             username: None,
             password: None,
+            boot_prompt: None,
+            boot_response: None,
+            stdout_rx: None,
+            stderr_rx: None,
         }
     }
 
@@ -708,9 +969,25 @@ mod tests {
     fn test_looks_like_shell_prompt() {
         assert!(looks_like_shell_prompt("# arch"));
         assert!(looks_like_shell_prompt("$ root@arch:"));
+        // Real-world trailing prompts (Alpine, Arch, generic sh).
+        assert!(looks_like_shell_prompt("localhost:~#"));
+        assert!(looks_like_shell_prompt("[root@archiso ~]#"));
+        assert!(looks_like_shell_prompt("sh-5.1$"));
         assert!(!looks_like_shell_prompt("log in:"));
         assert!(!looks_like_shell_prompt(""));
         assert!(!looks_like_shell_prompt("unknown: no boot prompt"));
+        // Shebangs are not prompts.
+        assert!(!looks_like_shell_prompt("#!/bin/sh"));
+    }
+
+    #[test]
+    fn test_partial_shell_prompt() {
+        // Newline-less prompts end with the prompt char + space.
+        assert!(is_partial_shell_prompt(b"localhost:~# "));
+        assert!(is_partial_shell_prompt(b"sh-5.1$ "));
+        assert!(!is_partial_shell_prompt(b"### Welcome to Alpine Linux ###"));
+        assert!(!is_partial_shell_prompt(b"localhost login: "));
+        assert!(!is_partial_shell_prompt(b""));
     }
 
     #[test]
@@ -721,7 +998,7 @@ mod tests {
         assert_eq!(password_line(Some("")), "\n");
         assert_eq!(password_line(Some("tty")), "tty\n");
         // Arch root (root + empty password) becomes two Enter lines.
-        let creds = format!("{} {}", username_line(Some("root")), password_line(Some("")));
+        let creds = format!("{}{}", username_line(Some("root")), password_line(Some("")));
         assert_eq!(creds, "root\n\n");
     }
 }

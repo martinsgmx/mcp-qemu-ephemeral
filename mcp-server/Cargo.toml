@@ -17,3 +17,5 @@ async-trait = "0.1"
 mcp-qemu-core = { path = "../core" }
 mcp-qemu-image-manager = { path = "../image-manager" }
 mcp-qemu-recipe = { path = "../recipe" }
+mcp-qemu-profiles = { path = "../profiles" }
+mcp-qemu-runner = { path = "../runner" }

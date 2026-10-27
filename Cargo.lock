@@ -503,7 +503,9 @@ dependencies = [
  "clap",
  "mcp-qemu-core",
  "mcp-qemu-image-manager",
+ "mcp-qemu-profiles",
  "mcp-qemu-recipe",
+ "mcp-qemu-runner",
  "tokio",
  "tracing",
 ]
@@ -543,7 +545,9 @@ dependencies = [
  "kuri_mcp_protocol",
  "mcp-qemu-core",
  "mcp-qemu-image-manager",
+ "mcp-qemu-profiles",
  "mcp-qemu-recipe",
+ "mcp-qemu-runner",
  "schemars",
  "serde",
  "serde_json",
@@ -552,16 +556,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-qemu-profiles"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "mcp-qemu-recipe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "mcp-qemu-core",
+ "mcp-qemu-profiles",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "mcp-qemu-runner"
+version = "0.1.0"
+dependencies = [
+ "mcp-qemu-core",
+ "mcp-qemu-image-manager",
+ "mcp-qemu-profiles",
+ "mcp-qemu-recipe",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

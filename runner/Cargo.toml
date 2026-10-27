@@ -1,0 +1,16 @@
+[package]
+name = "mcp-qemu-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = "1"
+tracing = { workspace = true }
+mcp-qemu-core = { path = "../core" }
+mcp-qemu-image-manager = { path = "../image-manager" }
+mcp-qemu-profiles = { path = "../profiles" }
+mcp-qemu-recipe = { path = "../recipe" }

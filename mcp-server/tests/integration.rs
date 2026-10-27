@@ -30,8 +30,12 @@ async fn test_qemu_handle_lifecycle_with_real_process() {
             guest_args: None,
             username: None,
             password: None,
+            boot_prompt: None,
+            boot_response: None,
             boot_timeout_secs: 120,
-            auto_boot_interact: true,
+            // A plain `echo` process cannot emulate a login → shell sequence,
+            // so the automatic boot interaction must stay off here.
+            auto_boot_interact: false,
         })
         .await
         .expect("spawn echo");
@@ -73,8 +77,12 @@ async fn test_qemu_handle_kill() {
             guest_args: None,
             username: None,
             password: None,
+            boot_prompt: None,
+            boot_response: None,
             boot_timeout_secs: 120,
-            auto_boot_interact: true,
+            // A plain `sleep` process cannot emulate a login → shell
+            // sequence, so the automatic boot interaction must stay off.
+            auto_boot_interact: false,
         })
         .await
         .expect("spawn sleep");

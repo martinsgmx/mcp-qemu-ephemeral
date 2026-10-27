@@ -56,6 +56,27 @@ pub enum ImageError {
     /// The image format is unsupported.
     #[error("unsupported image format: {0}")]
     UnsupportedFormat(String),
+    /// An ISO download failed.
+    #[error("download failed for {url}: {detail}")]
+    Download {
+        /// The URL that failed.
+        url: String,
+        /// What went wrong.
+        detail: String,
+    },
+    /// The downloaded ISO's sha256 does not match the mirror's published one.
+    #[error("checksum mismatch for {path}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        /// The file that failed verification.
+        path: PathBuf,
+        /// sha256 from the mirror's `.sha256` file.
+        expected: String,
+        /// sha256 actually computed.
+        actual: String,
+    },
+    /// An external helper tool (curl/wget/sha256sum) misbehaved.
+    #[error("external tool failed: {0}")]
+    Tool(String),
 }
 
 impl From<std::io::Error> for ImageError {
@@ -230,6 +251,162 @@ impl ImageManager {
         }
         Ok(())
     }
+
+    /// Directory holding downloaded ISO files (`<images_dir>/isos/`).
+    pub fn isos_dir(&self) -> PathBuf {
+        self.images_dir.join("isos")
+    }
+
+    /// Make sure the ISO at `url` is available locally, downloading it if
+    /// needed.
+    ///
+    /// - If the file already exists in `<images_dir>/isos/`, it is returned
+    ///   as-is (no re-download).
+    /// - Otherwise the ISO is fetched with `curl` (fallback `wget`) into the
+    ///   isos dir, verified against the mirror's companion `<name>.iso.sha256`
+    ///   when one is published, and only then moved to its final name.
+    pub async fn ensure_iso(&self, url: &str) -> Result<PathBuf> {
+        let dir = self.isos_dir();
+        fs::create_dir_all(&dir).await?;
+
+        let filename = url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ImageError::Download {
+                url: url.to_string(),
+                detail: "could not derive a file name from the URL".to_string(),
+            })?;
+        let final_path = dir.join(filename);
+
+        if final_path.exists() {
+            info!("ISO already present: {}", final_path.display());
+            return Ok(final_path);
+        }
+
+        let part_path = dir.join(format!("{filename}.part"));
+        let _ = fs::remove_file(&part_path).await;
+
+        self.download_to(url, &part_path).await?;
+
+        // Verify against the mirror's published checksum when available.
+        let sha_url = format!("{url}.sha256");
+        match self.fetch_text(&sha_url).await {
+            Ok(sha_text) => {
+                if let Some(expected) = sha_text.split_whitespace().next() {
+                    let actual = sha256_of(&part_path).await?;
+                    if actual != expected {
+                        let _ = fs::remove_file(&part_path).await;
+                        return Err(ImageError::ChecksumMismatch {
+                            path: part_path,
+                            expected: expected.to_string(),
+                            actual,
+                        });
+                    }
+                    info!("sha256 verified for {filename}");
+                }
+            }
+            Err(e) => {
+                // No companion checksum published (or mirror unreachable):
+                // keep the download but say so.
+                info!("no sha256 verification for {filename}: {e}");
+            }
+        }
+
+        fs::rename(&part_path, &final_path).await?;
+        info!("Downloaded ISO: {}", final_path.display());
+        Ok(final_path)
+    }
+
+    /// Pick the first available HTTP helper: curl, then wget.
+    fn http_tool() -> Option<&'static str> {
+        for tool in ["curl", "wget"] {
+            if tool_on_path(tool) {
+                return Some(tool);
+            }
+        }
+        None
+    }
+
+    /// Download `url` into `dest`, streaming to the file.
+    async fn download_to(&self, url: &str, dest: &Path) -> Result<()> {
+        let tool = Self::http_tool().ok_or_else(|| {
+            ImageError::Download {
+                url: url.to_string(),
+                detail: "neither curl nor wget is installed".to_string(),
+            }
+        })?;
+        let mut cmd = tokio::process::Command::new(tool);
+        match tool {
+            "curl" => {
+                cmd.args(["-fL", "--retry", "3", "-sS", "-o"]).arg(dest).arg(url);
+            }
+            "wget" => {
+                cmd.args(["-q", "-O"]).arg(dest).arg(url);
+            }
+            _ => unreachable!(),
+        }
+        let status = cmd.status().await.map_err(ImageError::Io)?;
+        if !status.success() {
+            let _ = fs::remove_file(dest).await;
+            return Err(ImageError::Download {
+                url: url.to_string(),
+                detail: format!("{tool} exited with {status}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Fetch a small text file from `url` (used for `.sha256` companions).
+    async fn fetch_text(&self, url: &str) -> Result<String> {
+        let tool = Self::http_tool().ok_or_else(|| ImageError::Tool(
+            "neither curl nor wget is installed".to_string(),
+        ))?;
+        let mut cmd = tokio::process::Command::new(tool);
+        match tool {
+            "curl" => cmd.args(["-fsSL"]).arg(url),
+            "wget" => cmd.args(["-qO-", "--timeout=15"]).arg(url),
+            _ => unreachable!(),
+        };
+        let out = cmd.output().await.map_err(ImageError::Io)?;
+        if !out.status.success() {
+            return Err(ImageError::Download {
+                url: url.to_string(),
+                detail: format!("{tool} exited with {}", out.status),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// True when an executable with `name` is reachable on PATH.
+fn tool_on_path(name: &str) -> bool {
+    std::env::var("PATH")
+        .map(|path| {
+            path.split(':')
+                .any(|dir| std::fs::metadata(format!("{dir}/{name}")).is_ok())
+        })
+        .unwrap_or(false)
+}
+
+/// Compute the sha256 of `path` via `sha256sum`.
+async fn sha256_of(path: &Path) -> Result<String> {
+    let out = tokio::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .await
+        .map_err(ImageError::Io)?;
+    if !out.status.success() {
+        return Err(ImageError::Tool(format!(
+            "sha256sum exited with {}",
+            out.status
+        )));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| ImageError::Tool("sha256sum produced no output".to_string()))
 }
 
 impl Default for ImageManager {

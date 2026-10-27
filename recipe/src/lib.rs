@@ -28,6 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Errors that can occur while managing recipes.
 #[derive(Debug, thiserror::Error)]
@@ -52,14 +53,30 @@ impl From<std::io::Error> for RecipeError {
     }
 }
 
+impl From<serde_yaml::Error> for RecipeError {
+    fn from(e: serde_yaml::Error) -> Self {
+        RecipeError::Parse(e.to_string())
+    }
+}
+
 /// Result type alias using `RecipeError`.
 pub type Result<T> = std::result::Result<T, RecipeError>;
 
 /// A parsed recipe describing a VM's configuration.
+///
+/// A recipe must reference at least one of `image` (a bootable disk) or
+/// `iso` (a CD-ROM image). Live-ISO workflows use `iso` only.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Recipe {
-    /// Path to the bootable disk image.
-    pub image: PathBuf,
+    /// Path to the bootable disk image (optional when `iso` is set).
+    #[serde(default)]
+    pub image: Option<PathBuf>,
+    /// Path to an ISO to attach as a CD-ROM (live-ISO workflows).
+    #[serde(default)]
+    pub iso: Option<PathBuf>,
+    /// Guest architecture (`x86_64` or `aarch64`); selects the QEMU binary.
+    #[serde(default)]
+    pub arch: Option<String>,
     /// Memory in MiB.
     pub memory_mib: u64,
     /// Number of CPUs.
@@ -75,6 +92,21 @@ pub struct Recipe {
     /// Optional extra QEMU arguments.
     #[serde(default)]
     pub qemu_args: Vec<String>,
+    /// Username for the serial-console boot interaction.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password for the serial-console boot interaction (empty = Enter).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Boot-loader prompt marker to answer (e.g. ISOLINUX `boot:`).
+    #[serde(default)]
+    pub boot_prompt: Option<String>,
+    /// Line to send at the boot-loader prompt.
+    #[serde(default)]
+    pub boot_response: Option<String>,
+    /// Boot timeout in seconds (default 120).
+    #[serde(default)]
+    pub boot_timeout_secs: Option<u64>,
 }
 
 impl Recipe {
@@ -88,12 +120,20 @@ impl Recipe {
         serde_json::from_str(doc).map_err(|e| RecipeError::Parse(e.to_string()))
     }
 
-    /// Validate the recipe: image exists, memory/CPUs in sane bounds.
+    /// Validate the recipe: an image and/or iso exists, memory/CPUs in sane
+    /// bounds, non-empty command.
     pub fn validate(&self) -> Result<()> {
-        if !self.image.exists() {
-            return Err(RecipeError::ImageNotFound {
-                path: self.image.clone(),
-            });
+        if self.image.is_none() && self.iso.is_none() {
+            return Err(RecipeError::Invalid(
+                "either image or iso is required".to_string(),
+            ));
+        }
+        if let Some(image) = &self.image {
+            if !image.exists() {
+                return Err(RecipeError::ImageNotFound {
+                    path: image.clone(),
+                });
+            }
         }
         if self.memory_mib == 0 || self.memory_mib > 1_048_576 {
             // 1 GiB max.
@@ -117,13 +157,35 @@ impl Recipe {
     /// Apply the recipe to build a QEMU config.
     pub fn apply(self) -> Result<mcp_qemu_core::QemuConfig> {
         self.validate()?;
+        // The QEMU binary follows the declared architecture.
+        let binary = self
+            .arch
+            .as_deref()
+            .map(|a| {
+                mcp_qemu_profiles::Arch::from_str(a)
+                    .map(|arch| arch.qemu_binary().to_string())
+                    .map_err(|e| RecipeError::Invalid(e))
+            })
+            .transpose()?
+            .unwrap_or_else(|| "qemu-system-x86_64".to_string());
+        // Architecture machine-model arguments (AArch64 needs `-M virt`).
+        let arch_machine_args = self
+            .arch
+            .as_deref()
+            .and_then(|a| mcp_qemu_profiles::Arch::from_str(a).ok())
+            .map(|arch| arch.qemu_machine_args().into_iter().map(String::from).collect())
+            .unwrap_or_default();
         Ok(mcp_qemu_core::QemuConfig {
-            binary: "qemu-system-x86_64".to_string(),
-            drive_image: Some(self.image.to_string_lossy().into_owned()),
-            iso: None,
+            binary,
+            drive_image: self
+                .image
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            iso: self.iso.as_ref().map(|p| p.to_string_lossy().into_owned()),
             memory_mib: self.memory_mib,
             cpus: self.cpus,
-            extra_args: self.qemu_args,
+            // Machine args come before user-supplied qemu_args.
+            extra_args: [arch_machine_args, self.qemu_args].concat(),
             cwd: None,
             env: self.env,
             // Root device: use the first partition of the drive image.
@@ -133,9 +195,11 @@ impl Recipe {
             guest_args: Some(self.args.clone()),
             agent_socket: None,
             serial_file: None,
-            username: None,
-            password: None,
-            boot_timeout_secs: 120,
+            username: self.username,
+            password: self.password,
+            boot_prompt: self.boot_prompt,
+            boot_response: self.boot_response,
+            boot_timeout_secs: self.boot_timeout_secs.unwrap_or(120),
             auto_boot_interact: true,
         })
     }
@@ -161,13 +225,20 @@ mod tests {
 
     fn sample_recipe() -> Recipe {
         Recipe {
-            image: PathBuf::from("/data/images/ubuntu.qcow2"),
+            image: Some(PathBuf::from("/data/images/ubuntu.qcow2")),
+            iso: None,
+            arch: None,
             memory_mib: 2048,
             cpus: 2,
             command: "/bin/bash".to_string(),
             args: vec!["-c".to_string(), "echo hi".to_string()],
             env: vec![("FOO".to_string(), "bar".to_string())],
             qemu_args: Vec::new(),
+            username: None,
+            boot_prompt: None,
+            boot_response: None,
+            password: None,
+            boot_timeout_secs: None,
         }
     }
 
@@ -225,16 +296,83 @@ env:
         let tmp = std::env::temp_dir().join("recipe_test_img.qcow2");
         std::fs::write(&tmp, b"dummy").unwrap();
         let recipe = Recipe {
-            image: tmp.clone(),
+            image: Some(tmp.clone()),
+            iso: None,
+            arch: None,
             memory_mib: 0,
             cpus: 2,
             command: "/bin/bash".to_string(),
             args: Vec::new(),
             env: Vec::new(),
             qemu_args: Vec::new(),
+            username: None,
+            boot_prompt: None,
+            boot_response: None,
+            password: None,
+            boot_timeout_secs: None,
         };
         let err = recipe.validate().unwrap_err();
         assert!(matches!(err, RecipeError::Invalid { .. }));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_validate_requires_image_or_iso() {
+        let recipe = Recipe {
+            image: None,
+            iso: None,
+            arch: None,
+            memory_mib: 1024,
+            cpus: 2,
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            qemu_args: Vec::new(),
+            username: None,
+            boot_prompt: None,
+            boot_response: None,
+            password: None,
+            boot_timeout_secs: None,
+        };
+        let err = recipe.validate().unwrap_err();
+        assert!(matches!(err, RecipeError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_iso_only_recipe_picks_arch_binary() {
+        // The image does not need to exist for an iso-only recipe.
+        let recipe = Recipe {
+            image: None,
+            iso: Some(PathBuf::from("/tmp/whatever-does-not-exist.iso")),
+            arch: Some("aarch64".to_string()),
+            memory_mib: 1024,
+            cpus: 2,
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            qemu_args: Vec::new(),
+            username: Some("root".to_string()),
+            boot_prompt: None,
+            boot_response: None,
+            password: Some("".to_string()),
+            boot_timeout_secs: Some(240),
+        };
+        let config = recipe.apply().unwrap();
+        assert_eq!(config.binary, "qemu-system-aarch64");
+        assert!(config.drive_image.is_none());
+        assert!(config.iso.is_some());
+        // AArch64 machine args were injected ahead of user args.
+        assert_eq!(
+            config.extra_args,
+            vec![
+                "-M".to_string(),
+                "virt".to_string(),
+                "-cpu".to_string(),
+                "cortex-a57".to_string()
+            ]
+        );
+        assert_eq!(config.username.as_deref(), Some("root"));
+        assert_eq!(config.password.as_deref(), Some(""));
+        assert_eq!(config.boot_timeout_secs, 240);
     }
 }
